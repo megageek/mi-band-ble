@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 from datetime import datetime
@@ -9,6 +10,7 @@ from bleak_retry_connector import BleakClientWithServiceCache, establish_connect
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CoreState
 from homeassistant.core import HomeAssistant
 from homeassistant.components.bluetooth import (
@@ -31,6 +33,8 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 BATTERY_READ_TIMEOUT: Final = 10.0
+BATTERY_TOTAL_TIMEOUT: Final = 15.0
+STARTUP_BATTERY_REFRESH_DELAY: Final = 15.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,21 +128,26 @@ async def _async_read_battery(
         getattr(connectable_device, "details", None),
     )
 
-    client = await establish_connection(
-        BleakClientWithServiceCache,
-        connectable_device,
-        connectable_device.address,
-        timeout=BATTERY_READ_TIMEOUT,
-    )
     try:
-        _LOGGER.debug(
-            "Reading battery characteristic %s from %s",
-            BATTERY_CHARACTERISTIC_UUID,
-            address,
-        )
-        raw = bytes(await client.read_gatt_char(BATTERY_CHARACTERISTIC_UUID))
-    finally:
-        await client.disconnect()
+        async with asyncio.timeout(BATTERY_TOTAL_TIMEOUT):
+            client = await establish_connection(
+                BleakClientWithServiceCache,
+                connectable_device,
+                connectable_device.address,
+                timeout=BATTERY_READ_TIMEOUT,
+            )
+            try:
+                _LOGGER.debug(
+                    "Reading battery characteristic %s from %s",
+                    BATTERY_CHARACTERISTIC_UUID,
+                    address,
+                )
+                raw = bytes(await client.read_gatt_char(BATTERY_CHARACTERISTIC_UUID))
+            finally:
+                await client.disconnect()
+    except TimeoutError:
+        _LOGGER.debug("Battery read timed out for %s", address)
+        raise
 
     _LOGGER.debug(
         "Battery read returned %s bytes from %s: %s",
@@ -147,6 +156,48 @@ async def _async_read_battery(
         raw.hex(),
     )
     return _parse_miband_battery(raw)
+
+
+async def _async_startup_battery_refresh(
+    hass: HomeAssistant,
+    address: str,
+    store: dict[str, object],
+) -> None:
+    await asyncio.sleep(STARTUP_BATTERY_REFRESH_DELAY)
+
+    connectable_scanners = bluetooth.async_scanner_count(hass, connectable=True)
+    if connectable_scanners < 1:
+        _LOGGER.debug(
+            "Skipping startup battery refresh for %s because no connectable scanners are available",
+            address,
+        )
+        return
+
+    if not bluetooth.async_address_present(hass, address, connectable=True):
+        _LOGGER.debug(
+            "Skipping startup battery refresh for %s because the device is not connectable-present",
+            address,
+        )
+        return
+
+    try:
+        _LOGGER.debug("Attempting delayed startup battery refresh for %s", address)
+        battery = await _async_read_battery(hass, address)
+    except Exception:
+        _LOGGER.exception("Delayed startup battery refresh failed for %s", address)
+        return
+
+    if battery is None:
+        _LOGGER.debug("Delayed startup battery refresh returned no parsed data for %s", address)
+        return
+
+    store["last_parsed"] = _combine(store["last_parsed"], battery)
+    _LOGGER.debug(
+        "Delayed startup battery refresh succeeded for %s: battery=%s charging=%s",
+        address,
+        battery.battery,
+        battery.charging,
+    )
 
 
 def _parse_steps_from_fee0(service_info: BluetoothServiceInfoBleak) -> int | None:
@@ -194,6 +245,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     store = hass.data[DOMAIN][entry.entry_id]
+    startup_refresh_task: asyncio.Task[None] | None = None
 
     def _update_method(service_info: BluetoothServiceInfoBleak) -> MiBandParsed:
         steps = _parse_steps_from_fee0(service_info)
@@ -277,21 +329,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    try:
-        _LOGGER.debug("Attempting immediate battery refresh for %s during setup", address)
-        battery = await _async_read_battery(hass, address)
-        if battery is None:
-            _LOGGER.debug("Immediate battery refresh returned no parsed data for %s", address)
-        else:
-            store["last_parsed"] = _combine(store["last_parsed"], battery)
-            _LOGGER.debug(
-                "Immediate battery refresh succeeded for %s: battery=%s charging=%s",
-                address,
-                battery.battery,
-                battery.charging,
+    def _start_background_battery_refresh(_event=None) -> None:
+        nonlocal startup_refresh_task
+        if startup_refresh_task is not None and not startup_refresh_task.done():
+            return
+
+        startup_refresh_task = hass.async_create_task(
+            _async_startup_battery_refresh(hass, address, store)
+        )
+
+    def _cancel_background_battery_refresh() -> None:
+        if startup_refresh_task is not None and not startup_refresh_task.done():
+            startup_refresh_task.cancel()
+
+    entry.async_on_unload(_cancel_background_battery_refresh)
+
+    if hass.state == CoreState.running:
+        _start_background_battery_refresh()
+    else:
+        entry.async_on_unload(
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED,
+                _start_background_battery_refresh,
             )
-    except Exception:
-        _LOGGER.exception("Immediate battery refresh failed for %s", address)
+        )
 
     entry.async_on_unload(coordinator.async_start())
     return True
