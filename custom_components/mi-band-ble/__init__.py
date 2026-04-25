@@ -109,6 +109,46 @@ def _parse_miband_battery(raw: bytes) -> MiBandBatteryData | None:
     return None
 
 
+async def _async_read_battery(
+    hass: HomeAssistant,
+    address: str,
+) -> MiBandBatteryData | None:
+    connectable_device = async_ble_device_from_address(hass, address, connectable=True)
+    if connectable_device is None:
+        _LOGGER.debug("No connectable BLE device available for battery read: %s", address)
+        return None
+
+    _LOGGER.debug(
+        "Resolved connectable BLE device for %s via %s",
+        address,
+        getattr(connectable_device, "details", None),
+    )
+
+    client = await establish_connection(
+        BleakClientWithServiceCache,
+        connectable_device,
+        connectable_device.address,
+        timeout=BATTERY_READ_TIMEOUT,
+    )
+    try:
+        _LOGGER.debug(
+            "Reading battery characteristic %s from %s",
+            BATTERY_CHARACTERISTIC_UUID,
+            address,
+        )
+        raw = bytes(await client.read_gatt_char(BATTERY_CHARACTERISTIC_UUID))
+    finally:
+        await client.disconnect()
+
+    _LOGGER.debug(
+        "Battery read returned %s bytes from %s: %s",
+        len(raw),
+        address,
+        raw.hex(),
+    )
+    return _parse_miband_battery(raw)
+
+
 def _parse_steps_from_fee0(service_info: BluetoothServiceInfoBleak) -> int | None:
     """Parse steps from 4 bytes little-endian in FEE0 service data."""
     sd = service_info.service_data or {}
@@ -142,6 +182,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     assert address is not None
 
     _LOGGER.info("Setting up Mi Band BLE for %s", address)
+    _LOGGER.debug(
+        "Connectable scanner count at setup for %s: %s",
+        address,
+        bluetooth.async_scanner_count(hass, connectable=True),
+    )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "address": address,
@@ -178,36 +223,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     def _needs_poll(
         service_info: BluetoothServiceInfoBleak, last_poll: float | None
     ) -> bool:
-        return (
+        has_connectable_device = bool(
+            async_ble_device_from_address(
+                hass, service_info.device.address, connectable=True
+            )
+        )
+        should_poll = (
             hass.state == CoreState.running
             and (last_poll is None or last_poll >= BATTERY_POLL_INTERVAL_SECONDS)
-            and bool(async_ble_device_from_address(hass, service_info.device.address, connectable=True))
+            and has_connectable_device
         )
+        _LOGGER.debug(
+            (
+                "Battery poll check for %s: should_poll=%s, hass_running=%s, "
+                "last_poll=%s, has_connectable_device=%s, service_info_connectable=%s"
+            ),
+            service_info.device.address,
+            should_poll,
+            hass.state == CoreState.running,
+            last_poll,
+            has_connectable_device,
+            service_info.connectable,
+        )
+        return should_poll
 
     async def _async_poll(service_info: BluetoothServiceInfoBleak) -> MiBandParsed:
-        connectable_device = async_ble_device_from_address(
-            hass, service_info.device.address, connectable=True
-        )
-        if connectable_device is None:
-            raise RuntimeError(f"No connectable device found for {service_info.device.address}")
-
-        client = await establish_connection(
-            BleakClientWithServiceCache,
-            connectable_device,
-            connectable_device.address,
-            timeout=BATTERY_READ_TIMEOUT,
-        )
-        try:
-            raw = bytes(await client.read_gatt_char(BATTERY_CHARACTERISTIC_UUID))
-        finally:
-            await client.disconnect()
-
-        battery = _parse_miband_battery(raw)
+        _LOGGER.debug("Starting battery poll for %s", service_info.device.address)
+        battery = await _async_read_battery(hass, service_info.device.address)
         if battery is None:
+            _LOGGER.debug("Battery poll did not produce parsed data for %s", service_info.device.address)
             return store["last_parsed"]
 
         parsed = _combine(store["last_parsed"], battery)
         store["last_parsed"] = parsed
+        _LOGGER.debug(
+            "Battery poll succeeded for %s: battery=%s charging=%s",
+            service_info.device.address,
+            battery.battery,
+            battery.charging,
+        )
         return parsed
 
     coordinator = store["coordinator"] = ActiveBluetoothProcessorCoordinator(
@@ -222,6 +276,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    try:
+        _LOGGER.debug("Attempting immediate battery refresh for %s during setup", address)
+        battery = await _async_read_battery(hass, address)
+        if battery is None:
+            _LOGGER.debug("Immediate battery refresh returned no parsed data for %s", address)
+        else:
+            store["last_parsed"] = _combine(store["last_parsed"], battery)
+            _LOGGER.debug(
+                "Immediate battery refresh succeeded for %s: battery=%s charging=%s",
+                address,
+                battery.battery,
+                battery.charging,
+            )
+    except Exception:
+        _LOGGER.exception("Immediate battery refresh failed for %s", address)
 
     entry.async_on_unload(coordinator.async_start())
     return True
