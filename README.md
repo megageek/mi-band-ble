@@ -82,6 +82,7 @@ Additional battery history sensors are created disabled by default:
 - **Connectable required for battery**: Battery entities need the Mi Band to be connectable and in range of a connectable Home Assistant Bluetooth adapter.
 - **Battery efficient**: Battery reads are infrequent and disconnect immediately after reading.
 - **Update frequency**: Advertisement-backed sensors update as broadcasts arrive. Battery data is refreshed about every 6 hours when the band is reachable.
+- **Authentication limitation**: Some Mi Band models or firmware versions require bonding or an auth key before GATT characteristics can be read. This integration can attempt the active connection, but it does not currently implement Mi Band auth-key negotiation.
 
 ## Troubleshooting
 
@@ -97,6 +98,13 @@ Additional battery history sensors are created disabled by default:
 - Confirm the Mi Band is not connected to another app (e.g., Mi Fit)
 - Check Home Assistant logs for errors: **Settings** → **System** → **Logs**
 - Verify Bluetooth integration is working with other devices
+
+### Battery polling does not update
+
+- Enable debug logging for `custom_components.mi-band-ble` and check the battery poll reason.
+- `no_connectable_device` means Home Assistant is only seeing passive advertisements; move the band closer to a connectable Bluetooth adapter or enable a connectable Bluetooth proxy.
+- `connect_timeout` means a connectable device was found, but the connection did not complete before the timeout.
+- `connect_or_gatt_failed` means the connection/read failed after polling started. If this persists, the band may require pairing or an auth key, which is not currently supported.
 
 ## Development
 

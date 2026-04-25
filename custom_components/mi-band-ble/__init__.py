@@ -239,13 +239,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
             return False
 
-        connectable_device = (
-            service_info.device
-            if service_info.connectable
-            else async_ble_device_from_address(
-                hass, service_info.device.address, connectable=True
-            )
-        )
+        connectable_device = _connectable_device(service_info)
         has_connectable_device = connectable_device is not None
         last_failure = store["last_battery_failure_monotonic"]
         failure_backoff_remaining = 0.0
@@ -275,23 +269,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             service_info.connectable,
             round(failure_backoff_remaining, 1),
         )
+        if not has_connectable_device:
+            _LOGGER.debug(
+                (
+                    "Battery poll unavailable for %s: no_connectable_device, "
+                    "service_info_connectable=%s"
+                ),
+                service_info.device.address,
+                service_info.connectable,
+            )
         return should_poll
+
+    def _connectable_device(service_info: BluetoothServiceInfoBleak):
+        if service_info.connectable:
+            return service_info.device
+
+        return async_ble_device_from_address(
+            hass, service_info.device.address, connectable=True
+        )
 
     async def _async_poll(service_info: BluetoothServiceInfoBleak) -> MiBandParsed:
         address = service_info.device.address
-        connectable_device = (
-            service_info.device
-            if service_info.connectable
-            else async_ble_device_from_address(hass, address, connectable=True)
-        )
+        connectable_device = _connectable_device(service_info)
 
         if connectable_device is None:
-            _LOGGER.debug("Battery poll skipped for %s because no connectable BLE device is available", address)
+            _LOGGER.debug(
+                (
+                    "Battery poll skipped for %s: no_connectable_device, "
+                    "service_info_connectable=%s"
+                ),
+                address,
+                service_info.connectable,
+            )
             return store["last_parsed"]
 
         _LOGGER.debug(
-            "Starting battery poll for %s via %s",
+            "Starting battery poll for %s: service_info_connectable=%s, device_address=%s, details=%s",
             address,
+            service_info.connectable,
+            connectable_device.address,
             getattr(connectable_device, "details", None),
         )
 
@@ -299,11 +315,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             battery = await _async_read_battery(connectable_device, address)
         except TimeoutError:
             store["last_battery_failure_monotonic"] = time.monotonic()
-            _LOGGER.warning("Battery poll timed out for %s", address)
+            _LOGGER.warning("Battery poll failed for %s: connect_timeout", address)
             return store["last_parsed"]
-        except Exception:
+        except Exception as err:
             store["last_battery_failure_monotonic"] = time.monotonic()
-            _LOGGER.warning("Battery poll failed for %s", address, exc_info=True)
+            _LOGGER.warning(
+                "Battery poll failed for %s: connect_or_gatt_failed, %s: %s",
+                address,
+                type(err).__name__,
+                err,
+                exc_info=True,
+            )
             return store["last_parsed"]
 
         if battery is None:
@@ -329,7 +351,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         update_method=_update_method,
         needs_poll_method=_needs_poll,
         poll_method=_async_poll,
-        connectable=False,
+        connectable=True,
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
