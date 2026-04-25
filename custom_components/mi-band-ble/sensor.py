@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from dataclasses import dataclass
 
 from homeassistant import config_entries
@@ -16,6 +17,7 @@ from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
+    SensorStateClass,
 )
 
 from .const import DOMAIN
@@ -46,14 +48,50 @@ HEART_DESC = MiBandSensorDescription(
     native_unit_of_measurement="bpm",
 )
 
+BATTERY_DESC = MiBandSensorDescription(
+    key="battery",
+    name="Battery",
+    native_unit_of_measurement="%",
+    device_class=SensorDeviceClass.BATTERY,
+    state_class=SensorStateClass.MEASUREMENT,
+)
 
-def _to_update(parsed: MiBandParsed) -> PassiveBluetoothDataUpdate[int]:
+FULL_CHARGING_TIMESTAMP_DESC = MiBandSensorDescription(
+    key="full_charging_timestamp",
+    name="Full Charging Timestamp",
+    device_class=SensorDeviceClass.TIMESTAMP,
+    entity_registry_enabled_default=False,
+)
+
+LAST_CHARGING_TIMESTAMP_DESC = MiBandSensorDescription(
+    key="last_charging_timestamp",
+    name="Last Charging Timestamp",
+    device_class=SensorDeviceClass.TIMESTAMP,
+    entity_registry_enabled_default=False,
+)
+
+BATTERY_LAST_CHARGING_DESC = MiBandSensorDescription(
+    key="battery_last_charging",
+    name="Battery Last Charging",
+    native_unit_of_measurement="%",
+    state_class=SensorStateClass.MEASUREMENT,
+    entity_registry_enabled_default=False,
+)
+
+
+def _to_update(
+    parsed: MiBandParsed,
+) -> PassiveBluetoothDataUpdate[int | datetime]:
     """Convert parsed data to a PassiveBluetoothDataUpdate."""
     entity_data = {}
     entity_desc = {}
     entity_names = {}
 
-    def add(key: str, desc: SensorEntityDescription, value: int | None):
+    def add(
+        key: str,
+        desc: SensorEntityDescription,
+        value: int | datetime | None,
+    ) -> None:
         if value is None:
             return
         ek = PassiveBluetoothEntityKey(key=key, device_id=None)
@@ -67,6 +105,18 @@ def _to_update(parsed: MiBandParsed) -> PassiveBluetoothDataUpdate[int]:
 
     # Heart rate is optional/toggleable; ONLY create if HR adverts are received.
     add("heart_rate", HEART_DESC, parsed.heart_rate)
+    add("battery", BATTERY_DESC, parsed.battery)
+    add(
+        "full_charging_timestamp",
+        FULL_CHARGING_TIMESTAMP_DESC,
+        parsed.full_charging_timestamp,
+    )
+    add(
+        "last_charging_timestamp",
+        LAST_CHARGING_TIMESTAMP_DESC,
+        parsed.last_charging_timestamp,
+    )
+    add("battery_last_charging", BATTERY_LAST_CHARGING_DESC, parsed.battery_last_charging)
 
     return PassiveBluetoothDataUpdate(
         devices={},
@@ -94,5 +144,5 @@ class MiBandSensorEntity(PassiveBluetoothProcessorEntity, SensorEntity):
     """Sensors driven by BLE advertisements."""
 
     @property
-    def native_value(self) -> int | None:
+    def native_value(self) -> int | datetime | None:
         return self.processor.entity_data.get(self.entity_key)

@@ -3,6 +3,13 @@ from __future__ import annotations
 from datetime import timedelta
 
 from homeassistant import config_entries
+from homeassistant.components.bluetooth.passive_update_processor import (
+    PassiveBluetoothDataProcessor,
+    PassiveBluetoothDataUpdate,
+    PassiveBluetoothEntityKey,
+    PassiveBluetoothProcessorCoordinator,
+    PassiveBluetoothProcessorEntity,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
@@ -10,13 +17,40 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
     BinarySensorDeviceClass,
+    BinarySensorEntityDescription,
 )
 from homeassistant.components import bluetooth
 from homeassistant.helpers import device_registry as dr
 
+from . import MiBandParsed
 from .const import DOMAIN
 
 UPDATE_INTERVAL = timedelta(seconds=10)
+
+CHARGING_DESC = BinarySensorEntityDescription(
+    key="charging",
+    name="Battery Charging",
+    device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
+)
+
+
+def _to_update(parsed: MiBandParsed) -> PassiveBluetoothDataUpdate[bool]:
+    entity_data = {}
+    entity_desc = {}
+    entity_names = {}
+
+    if parsed.charging is not None:
+        entity_key = PassiveBluetoothEntityKey(key="charging", device_id=None)
+        entity_data[entity_key] = parsed.charging
+        entity_desc[entity_key] = CHARGING_DESC
+        entity_names[entity_key] = None
+
+    return PassiveBluetoothDataUpdate(
+        devices={},
+        entity_descriptions=entity_desc,
+        entity_data=entity_data,
+        entity_names=entity_names,
+    )
 
 
 async def async_setup_entry(
@@ -24,7 +58,14 @@ async def async_setup_entry(
     entry: config_entries.ConfigEntry,
     async_add_entities,
 ) -> None:
+    coordinator: PassiveBluetoothProcessorCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    processor = PassiveBluetoothDataProcessor(_to_update)
+
     async_add_entities([MiBandPresenceEntity(hass, entry)])
+    entry.async_on_unload(
+        processor.async_add_entities_listener(MiBandChargingEntity, async_add_entities)
+    )
+    entry.async_on_unload(coordinator.async_register_processor(processor))
 
 
 class MiBandPresenceEntity(BinarySensorEntity):
@@ -76,3 +117,11 @@ class MiBandPresenceEntity(BinarySensorEntity):
         if self._unsub:
             self._unsub()
             self._unsub = None
+
+
+class MiBandChargingEntity(PassiveBluetoothProcessorEntity, BinarySensorEntity):
+    """Battery charging state driven by Bluetooth updates."""
+
+    @property
+    def is_on(self) -> bool | None:
+        return self.processor.entity_data.get(self.entity_key)
