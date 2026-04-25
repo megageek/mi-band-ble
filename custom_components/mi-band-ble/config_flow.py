@@ -5,6 +5,7 @@ from typing import Any
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
+from homeassistant.core import callback
 
 from .const import (
     CONF_BATTERY_FAILURE_BACKOFF_SECONDS,
@@ -55,10 +56,11 @@ class MiBandAdvConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     @staticmethod
+    @callback
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> MiBandOptionsFlow:
-        return MiBandOptionsFlow(config_entry)
+        return MiBandOptionsFlow()
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
@@ -95,9 +97,6 @@ class MiBandAdvConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class MiBandOptionsFlow(config_entries.OptionsFlow):
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
-
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
