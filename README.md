@@ -85,6 +85,8 @@ Additional battery history sensors are created disabled by default:
 - **Update frequency**: Advertisement-backed sensors update as broadcasts arrive. Battery data is refreshed about every 6 hours when the band is reachable.
 - **Auth-key support**: Some Mi Band models or firmware versions require an auth key before GATT characteristics can be read. Paste a key obtained from Notify, Zepp Life/Mi Fit, or a freemyband-style flow into the integration options.
 - **Auth-key storage**: The auth key is stored in Home Assistant's config entry options. Do not share logs or config storage that include your key.
+- **Battery entities**: Battery entities are deleted when battery polling is disabled, and recreated after polling is re-enabled and a battery read succeeds.
+- **Notify coexistence**: Mi Bands usually allow only one active BLE connection at a time. After an active battery read, the integration waits briefly before another active poll so apps like Notify have a chance to reconnect.
 
 ## Troubleshooting
 
@@ -105,7 +107,7 @@ Additional battery history sensors are created disabled by default:
 
 - Enable debug logging for `custom_components.mi-band-ble` and check the battery poll reason.
 - `no_connectable_device` means Home Assistant is only seeing passive advertisements; move the band closer to a connectable Bluetooth adapter or enable a connectable Bluetooth proxy.
-- `connect_timeout` means a connectable device was found, but the connection did not complete before the timeout.
+- `connect_timeout` means a connectable device was found, but the connection did not complete before the timeout. This can happen if Notify, Zepp Life, or another app is currently connected to the band.
 - `auth_failed` means the configured key was rejected, the auth characteristic was unavailable, or the auth notification flow timed out.
 - `auth_not_configured_maybe_required` means the battery read failed without an auth key configured; Mi Band 5 usually requires a valid key.
 - `battery_gatt_failed` means authentication succeeded, but the battery characteristic read failed.

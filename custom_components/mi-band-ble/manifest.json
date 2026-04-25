@@ -1,7 +1,7 @@
 {
   "domain": "mi-band-ble",
   "name": "Mi Band BLE",
-  "version": "0.2.4",
+  "version": "0.2.6",
   "documentation": "https://github.com/megageek/mi-band-ble",
   "issue_tracker": "https://github.com/megageek/mi-band-ble/issues",
   "requirements": ["bleak-retry-connector>=4.4.3"],

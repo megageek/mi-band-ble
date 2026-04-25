@@ -21,6 +21,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.components.bluetooth.active_update_processor import (
     ActiveBluetoothProcessorCoordinator,
 )
+from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -50,6 +51,26 @@ AUTH_CHALLENGE_LENGTH: Final = 16
 BATTERY_CONNECT_TIMEOUT: Final = 15.0
 BATTERY_AUTH_TIMEOUT: Final = 10.0
 BATTERY_READ_TIMEOUT: Final = 10.0
+BATTERY_DISCONNECT_TIMEOUT: Final = 5.0
+BATTERY_POST_DISCONNECT_QUIET_SECONDS: Final = 60.0
+BATTERY_ENTITY_KEYS: Final = frozenset(
+    {
+        "battery",
+        "charging",
+        "full_charging_timestamp",
+        "last_charging_timestamp",
+        "battery_last_charging",
+    }
+)
+BATTERY_ENTITY_NAMES: Final = frozenset(
+    {
+        "Battery",
+        "Battery Charging",
+        "Full Charging Timestamp",
+        "Last Charging Timestamp",
+        "Battery Last Charging",
+    }
+)
 
 
 class MiBandConnectTimeoutError(Exception):
@@ -97,6 +118,82 @@ def _combine(parsed: MiBandParsed, battery: MiBandBatteryData | None = None) -> 
         last_charging_timestamp=battery.last_charging_timestamp,
         battery_last_charging=battery.battery_last_charging,
     )
+
+
+def _clear_battery_data(parsed: MiBandParsed) -> MiBandParsed:
+    return dataclasses.replace(
+        parsed,
+        battery=None,
+        charging=None,
+        full_charging_timestamp=None,
+        last_charging_timestamp=None,
+        battery_last_charging=None,
+    )
+
+
+def _registry_entry_config_entry_ids(registry_entry) -> set[str]:
+    config_entry_ids = getattr(registry_entry, "config_entry_ids", None)
+    if config_entry_ids is not None:
+        return set(config_entry_ids)
+
+    config_entry_id = getattr(registry_entry, "config_entry_id", None)
+    return {config_entry_id} if config_entry_id else set()
+
+
+def _registry_entry_name(registry_entry) -> str | None:
+    return (
+        getattr(registry_entry, "original_name", None)
+        or getattr(registry_entry, "name", None)
+    )
+
+
+def _is_battery_entity_registry_entry(
+    registry_entry,
+    entry: ConfigEntry,
+) -> bool:
+    if entry.entry_id not in _registry_entry_config_entry_ids(registry_entry):
+        return False
+
+    if registry_entry.domain not in {"sensor", "binary_sensor"}:
+        return False
+
+    unique_id = (registry_entry.unique_id or "").lower()
+    for key in BATTERY_ENTITY_KEYS:
+        if (
+            unique_id == key
+            or unique_id.endswith(f"-{key}")
+            or unique_id.endswith(f"_{key}")
+            or unique_id.endswith(f":{key}")
+        ):
+            return True
+
+    name = _registry_entry_name(registry_entry)
+    return name in BATTERY_ENTITY_NAMES
+
+
+async def _async_remove_battery_entities(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    address: str,
+) -> None:
+    entity_registry = er.async_get(hass)
+    entity_ids = [
+        registry_entry.entity_id
+        for registry_entry in list(entity_registry.entities.values())
+        if _is_battery_entity_registry_entry(registry_entry, entry)
+    ]
+
+    for entity_id in entity_ids:
+        entity_registry.async_remove(entity_id)
+        if hass.states.get(entity_id) is not None:
+            hass.states.async_remove(entity_id)
+
+    if entity_ids:
+        _LOGGER.debug(
+            "Removed battery entities for %s because battery polling is disabled: %s",
+            address,
+            entity_ids,
+        )
 
 
 def _build_datetime(year: int, month: int, day: int, hour: int, minute: int, second: int) -> datetime | None:
@@ -235,6 +332,7 @@ async def _async_read_battery(
     address: str,
     auth_key_hex: str,
 ) -> MiBandBatteryData | None:
+    client = None
     try:
         async with asyncio.timeout(BATTERY_CONNECT_TIMEOUT):
             client = await establish_connection(
@@ -270,7 +368,24 @@ async def _async_read_battery(
                 )
                 raise MiBandBatteryReadError(reason) from err
         finally:
-            await client.disconnect()
+            try:
+                async with asyncio.timeout(BATTERY_DISCONNECT_TIMEOUT):
+                    await client.disconnect()
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Battery poll disconnect timed out for %s; Notify may need longer to reconnect",
+                    address,
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Battery poll disconnect failed for %s: %s: %s",
+                    address,
+                    type(err).__name__,
+                    err,
+                    exc_info=True,
+                )
+            else:
+                _LOGGER.debug("Battery poll disconnected cleanly from %s", address)
     except MiBandAuthError:
         raise
 
@@ -320,6 +435,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "address": address,
         "battery_poll_in_progress": False,
+        "last_battery_poll_finished_monotonic": None,
         "last_parsed": MiBandParsed(),
         "last_battery_failure_monotonic": None,
     }
@@ -330,6 +446,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass: HomeAssistant, updated_entry: ConfigEntry
     ) -> None:
         store["last_battery_failure_monotonic"] = None
+        if not updated_entry.options.get(
+            CONF_ENABLE_BATTERY_POLLING, DEFAULT_ENABLE_BATTERY_POLLING
+        ):
+            store["last_parsed"] = _clear_battery_data(store["last_parsed"])
+            store["last_battery_poll_finished_monotonic"] = None
+            await _async_remove_battery_entities(hass, updated_entry, address)
         _LOGGER.debug(
             "Mi Band BLE options updated for %s; battery failure backoff cleared",
             updated_entry.unique_id,
@@ -365,15 +487,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if heart_rate is not None:
             _LOGGER.debug("HR=%s from %s", heart_rate, address)
 
+        battery_polling_enabled = _battery_polling_enabled()
         parsed = MiBandParsed(
             steps=steps,
             heart_rate=heart_rate,
             rssi=rssi,
-            battery=previous.battery,
-            charging=previous.charging,
-            full_charging_timestamp=previous.full_charging_timestamp,
-            last_charging_timestamp=previous.last_charging_timestamp,
-            battery_last_charging=previous.battery_last_charging,
+            battery=previous.battery if battery_polling_enabled else None,
+            charging=previous.charging if battery_polling_enabled else None,
+            full_charging_timestamp=(
+                previous.full_charging_timestamp if battery_polling_enabled else None
+            ),
+            last_charging_timestamp=(
+                previous.last_charging_timestamp if battery_polling_enabled else None
+            ),
+            battery_last_charging=(
+                previous.battery_last_charging if battery_polling_enabled else None
+            ),
         )
         store["last_parsed"] = parsed
         return parsed
@@ -391,6 +520,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         connectable_device = _connectable_device(service_info)
         has_connectable_device = connectable_device is not None
         battery_poll_in_progress = store["battery_poll_in_progress"]
+        last_finished = store["last_battery_poll_finished_monotonic"]
+        post_poll_quiet_remaining = 0.0
+        if last_finished is not None:
+            post_poll_quiet_remaining = max(
+                0.0,
+                BATTERY_POST_DISCONNECT_QUIET_SECONDS
+                - (time.monotonic() - last_finished),
+            )
         last_failure = store["last_battery_failure_monotonic"]
         failure_backoff_remaining = 0.0
         if last_failure is not None:
@@ -404,13 +541,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             and (last_poll is None or last_poll >= BATTERY_POLL_INTERVAL_SECONDS)
             and has_connectable_device
             and not battery_poll_in_progress
+            and post_poll_quiet_remaining == 0.0
             and failure_backoff_remaining == 0.0
         )
         _LOGGER.debug(
             (
                 "Battery poll check for %s: should_poll=%s, hass_running=%s, "
                 "last_poll=%s, has_connectable_device=%s, service_info_connectable=%s, "
-                "battery_poll_in_progress=%s, failure_backoff_remaining=%s"
+                "battery_poll_in_progress=%s, post_poll_quiet_remaining=%s, "
+                "failure_backoff_remaining=%s"
             ),
             service_info.device.address,
             should_poll,
@@ -419,8 +558,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             has_connectable_device,
             service_info.connectable,
             battery_poll_in_progress,
+            round(post_poll_quiet_remaining, 1),
             round(failure_backoff_remaining, 1),
         )
+        if post_poll_quiet_remaining > 0.0:
+            _LOGGER.debug(
+                "Battery poll skipped for %s because post-poll quiet window has %.1fs remaining",
+                service_info.device.address,
+                post_poll_quiet_remaining,
+            )
         if battery_poll_in_progress:
             _LOGGER.debug(
                 "Battery poll skipped for %s because another battery poll is already running",
@@ -447,6 +593,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _async_poll(service_info: BluetoothServiceInfoBleak) -> MiBandParsed:
         address = service_info.device.address
+        active_poll_started = False
         if store["battery_poll_in_progress"]:
             _LOGGER.debug(
                 "Battery poll skipped for %s because another battery poll is already running",
@@ -469,6 +616,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
                 return store["last_parsed"]
 
+            active_poll_started = True
             _LOGGER.debug(
                 "Starting battery poll for %s: service_info_connectable=%s, device_address=%s, details=%s",
                 address,
@@ -481,7 +629,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 battery = await _async_read_battery(connectable_device, address, _auth_key())
             except MiBandConnectTimeoutError:
                 store["last_battery_failure_monotonic"] = time.monotonic()
-                _LOGGER.warning("Battery poll failed for %s: connect_timeout", address)
+                _LOGGER.warning(
+                    (
+                        "Battery poll failed for %s: connect_timeout; possible causes "
+                        "include range, adapter/proxy issues, or another app such as "
+                        "Notify currently connected"
+                    ),
+                    address,
+                )
                 return store["last_parsed"]
             except MiBandAuthError as err:
                 store["last_battery_failure_monotonic"] = time.monotonic()
@@ -516,6 +671,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.debug("Battery poll did not produce parsed data for %s", address)
                 return store["last_parsed"]
 
+            if not _battery_polling_enabled():
+                parsed = _clear_battery_data(store["last_parsed"])
+                store["last_parsed"] = parsed
+                _LOGGER.debug(
+                    "Discarded battery poll result for %s because battery polling is disabled",
+                    address,
+                )
+                return parsed
+
             store["last_battery_failure_monotonic"] = None
             parsed = _combine(store["last_parsed"], battery)
             store["last_parsed"] = parsed
@@ -528,6 +692,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return parsed
         finally:
             store["battery_poll_in_progress"] = False
+            if active_poll_started:
+                store["last_battery_poll_finished_monotonic"] = time.monotonic()
 
     coordinator = store["coordinator"] = ActiveBluetoothProcessorCoordinator(
         hass,
