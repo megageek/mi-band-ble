@@ -1,0 +1,16 @@
+{
+  "domain": "mi-band-ble",
+  "name": "Mi Band BLE",
+  "version": "0.2.1",
+  "documentation": "https://github.com/megageek/mi-band-ble",
+  "issue_tracker": "https://github.com/megageek/mi-band-ble/issues",
+  "requirements": [],
+  "codeowners": ["@megageek"],
+  "config_flow": true,
+  "dependencies": ["bluetooth"],
+  "iot_class": "local_push",
+  "bluetooth": [
+    { "service_uuid": "0000fee0-0000-1000-8000-00805f9b34fb", "connectable": false },
+    { "manufacturer_id": 343, "connectable": false }
+  ]
+}

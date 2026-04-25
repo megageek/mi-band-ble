@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "bluetooth_confirm": {
+        "title": "Add Mi Band",
+        "description": "Found {name} ({address}). Add it to Home Assistant?"
+      }
+    },
+    "abort": {
+      "not_supported": "This Bluetooth device doesn't look like a supported Mi Band advertisement."
+    }
+  }
+}
