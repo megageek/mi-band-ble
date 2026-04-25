@@ -6,16 +6,33 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
 from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 
 from .const import (
+    CONF_AUTH_KEY,
     CONF_BATTERY_FAILURE_BACKOFF_SECONDS,
     CONF_ENABLE_BATTERY_POLLING,
+    DEFAULT_AUTH_KEY,
     DEFAULT_BATTERY_FAILURE_BACKOFF_SECONDS,
     DEFAULT_ENABLE_BATTERY_POLLING,
     DOMAIN,
     MI_MANUFACTURER_ID,
     MI_SERVICE_UUID_FULL,
 )
+
+
+def _normalize_auth_key(auth_key: str | None) -> str:
+    """Normalize a Mi Band auth key from common pasted formats."""
+    if not auth_key:
+        return ""
+
+    return "".join(
+        ch for ch in auth_key.lower() if not ch.isspace() and ch not in ":-"
+    )
 
 
 def _options_schema(options: dict[str, Any]) -> vol.Schema:
@@ -34,6 +51,10 @@ def _options_schema(options: dict[str, Any]) -> vol.Schema:
                     DEFAULT_BATTERY_FAILURE_BACKOFF_SECONDS,
                 ),
             ): vol.All(vol.Coerce(int), vol.Range(min=60, max=24 * 60 * 60)),
+            vol.Optional(
+                CONF_AUTH_KEY,
+                default=options.get(CONF_AUTH_KEY, DEFAULT_AUTH_KEY),
+            ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
         }
     )
 
@@ -101,6 +122,25 @@ class MiBandOptionsFlow(config_entries.OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         if user_input is not None:
+            errors: dict[str, str] = {}
+            normalized_auth_key = _normalize_auth_key(user_input.get(CONF_AUTH_KEY))
+            if normalized_auth_key:
+                try:
+                    bytes.fromhex(normalized_auth_key)
+                except ValueError:
+                    errors[CONF_AUTH_KEY] = "invalid_auth_key"
+                else:
+                    if len(normalized_auth_key) != 32:
+                        errors[CONF_AUTH_KEY] = "invalid_auth_key"
+
+            if errors:
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=_options_schema(user_input),
+                    errors=errors,
+                )
+
+            user_input[CONF_AUTH_KEY] = normalized_auth_key
             return self.async_create_entry(title="", data=user_input)
 
         return self.async_show_form(

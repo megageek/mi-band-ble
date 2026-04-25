@@ -16,9 +16,13 @@
         "title": "Mi Band BLE Options",
         "data": {
           "enable_battery_polling": "Enable battery polling",
-          "battery_failure_backoff_seconds": "Battery retry backoff (seconds)"
+          "battery_failure_backoff_seconds": "Battery retry backoff (seconds)",
+          "auth_key": "Mi Band auth key"
         }
       }
+    },
+    "error": {
+      "invalid_auth_key": "Enter a 32-character hexadecimal auth key."
     }
   }
 }

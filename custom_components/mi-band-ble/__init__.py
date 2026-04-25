@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import time
@@ -8,6 +9,7 @@ from datetime import datetime
 from typing import Final
 
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CoreState
@@ -22,10 +24,13 @@ from homeassistant.components.bluetooth.active_update_processor import (
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    AUTH_CHARACTERISTIC_UUID,
     BATTERY_CHARACTERISTIC_UUID,
     BATTERY_POLL_INTERVAL_SECONDS,
+    CONF_AUTH_KEY,
     CONF_BATTERY_FAILURE_BACKOFF_SECONDS,
     CONF_ENABLE_BATTERY_POLLING,
+    DEFAULT_AUTH_KEY,
     DEFAULT_BATTERY_FAILURE_BACKOFF_SECONDS,
     DEFAULT_ENABLE_BATTERY_POLLING,
     DOMAIN,
@@ -35,8 +40,28 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+AUTH_COMMAND_SEND_KEY: Final = 0x01
+AUTH_COMMAND_REQUEST_RANDOM: Final = 0x02
+AUTH_COMMAND_SEND_ENCRYPTED: Final = 0x03
+AUTH_RESPONSE: Final = 0x10
+AUTH_SUCCESS: Final = 0x01
+AUTH_KEY_LENGTH: Final = 16
+AUTH_CHALLENGE_LENGTH: Final = 16
+BATTERY_CONNECT_TIMEOUT: Final = 15.0
+BATTERY_AUTH_TIMEOUT: Final = 10.0
 BATTERY_READ_TIMEOUT: Final = 10.0
-BATTERY_TOTAL_TIMEOUT: Final = 15.0
+
+
+class MiBandConnectTimeoutError(Exception):
+    """Raised when an active BLE connection cannot be established in time."""
+
+
+class MiBandAuthError(Exception):
+    """Raised when Mi Band auth-key authentication fails."""
+
+
+class MiBandBatteryReadError(Exception):
+    """Raised when an active battery GATT read fails."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,29 +140,138 @@ def _parse_miband_battery(raw: bytes) -> MiBandBatteryData | None:
     return None
 
 
+def _encrypt_auth_challenge(auth_key: bytes, challenge: bytes) -> bytes:
+    encryptor = Cipher(algorithms.AES(auth_key), modes.ECB()).encryptor()
+    return encryptor.update(challenge) + encryptor.finalize()
+
+
+async def _async_wait_for_auth_response(
+    responses: asyncio.Queue[bytes],
+    command: int,
+) -> bytes:
+    try:
+        async with asyncio.timeout(BATTERY_AUTH_TIMEOUT):
+            while True:
+                response = await responses.get()
+                if len(response) >= 3 and response[0] == AUTH_RESPONSE and response[1] == command:
+                    return response
+    except TimeoutError as err:
+        raise MiBandAuthError(f"timed out waiting for auth command 0x{command:02x}") from err
+
+
+def _validate_auth_success(response: bytes, command: int) -> None:
+    if len(response) < 3:
+        raise MiBandAuthError(f"malformed auth response for command 0x{command:02x}")
+
+    if response[2] != AUTH_SUCCESS:
+        raise MiBandAuthError(
+            f"auth command 0x{command:02x} returned status 0x{response[2]:02x}"
+        )
+
+
+async def _async_authenticate_miband(client, address: str, auth_key_hex: str) -> None:
+    auth_key = bytes.fromhex(auth_key_hex)
+    if len(auth_key) != AUTH_KEY_LENGTH:
+        raise MiBandAuthError("auth key must be 16 bytes")
+
+    responses: asyncio.Queue[bytes] = asyncio.Queue()
+
+    def _auth_notification(_sender, data: bytearray) -> None:
+        responses.put_nowait(bytes(data))
+
+    _LOGGER.debug("Starting Mi Band auth-key authentication for %s", address)
+
+    try:
+        await client.start_notify(AUTH_CHARACTERISTIC_UUID, _auth_notification)
+    except Exception as err:
+        raise MiBandAuthError("auth characteristic is not available") from err
+
+    try:
+        await client.write_gatt_char(
+            AUTH_CHARACTERISTIC_UUID,
+            bytes([AUTH_COMMAND_SEND_KEY, 0x00]) + auth_key,
+            response=False,
+        )
+        send_key_response = await _async_wait_for_auth_response(
+            responses, AUTH_COMMAND_SEND_KEY
+        )
+        _validate_auth_success(send_key_response, AUTH_COMMAND_SEND_KEY)
+
+        await client.write_gatt_char(
+            AUTH_CHARACTERISTIC_UUID,
+            bytes([AUTH_COMMAND_REQUEST_RANDOM, 0x00]),
+            response=False,
+        )
+        random_response = await _async_wait_for_auth_response(
+            responses, AUTH_COMMAND_REQUEST_RANDOM
+        )
+        _validate_auth_success(random_response, AUTH_COMMAND_REQUEST_RANDOM)
+
+        challenge = random_response[3:]
+        if len(challenge) != AUTH_CHALLENGE_LENGTH:
+            raise MiBandAuthError(
+                f"auth challenge has unexpected length {len(challenge)}"
+            )
+
+        await client.write_gatt_char(
+            AUTH_CHARACTERISTIC_UUID,
+            bytes([AUTH_COMMAND_SEND_ENCRYPTED, 0x00])
+            + _encrypt_auth_challenge(auth_key, challenge),
+            response=False,
+        )
+        encrypted_response = await _async_wait_for_auth_response(
+            responses, AUTH_COMMAND_SEND_ENCRYPTED
+        )
+        _validate_auth_success(encrypted_response, AUTH_COMMAND_SEND_ENCRYPTED)
+    finally:
+        with contextlib.suppress(Exception):
+            await client.stop_notify(AUTH_CHARACTERISTIC_UUID)
+
+    _LOGGER.debug("Mi Band auth-key authentication succeeded for %s", address)
+
+
 async def _async_read_battery(
     connectable_device,
     address: str,
+    auth_key_hex: str,
 ) -> MiBandBatteryData | None:
     try:
-        async with asyncio.timeout(BATTERY_TOTAL_TIMEOUT):
+        async with asyncio.timeout(BATTERY_CONNECT_TIMEOUT):
             client = await establish_connection(
                 BleakClientWithServiceCache,
                 connectable_device,
                 connectable_device.address,
-                timeout=BATTERY_READ_TIMEOUT,
+                timeout=BATTERY_CONNECT_TIMEOUT,
             )
+    except TimeoutError as err:
+        _LOGGER.debug("Battery connection timed out for %s", address)
+        raise MiBandConnectTimeoutError from err
+
+    try:
+        try:
+            if auth_key_hex:
+                await _async_authenticate_miband(client, address, auth_key_hex)
+
             try:
                 _LOGGER.debug(
                     "Reading battery characteristic %s from %s",
                     BATTERY_CHARACTERISTIC_UUID,
                     address,
                 )
-                raw = bytes(await client.read_gatt_char(BATTERY_CHARACTERISTIC_UUID))
-            finally:
-                await client.disconnect()
-    except TimeoutError:
-        _LOGGER.debug("Battery read timed out for %s", address)
+                async with asyncio.timeout(BATTERY_READ_TIMEOUT):
+                    raw = bytes(
+                        await client.read_gatt_char(BATTERY_CHARACTERISTIC_UUID)
+                    )
+            except Exception as err:
+                reason = (
+                    "battery_gatt_failed"
+                    if auth_key_hex
+                    else "auth_not_configured_maybe_required"
+                )
+                raise MiBandBatteryReadError(reason) from err
+        finally:
+            await client.disconnect()
+    except MiBandAuthError:
         raise
 
     _LOGGER.debug(
@@ -191,6 +325,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     store = hass.data[DOMAIN][entry.entry_id]
 
+    async def _async_options_updated(
+        hass: HomeAssistant, updated_entry: ConfigEntry
+    ) -> None:
+        store["last_battery_failure_monotonic"] = None
+        _LOGGER.debug(
+            "Mi Band BLE options updated for %s; battery failure backoff cleared",
+            updated_entry.unique_id,
+        )
+
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
     def _battery_polling_enabled() -> bool:
         return entry.options.get(
             CONF_ENABLE_BATTERY_POLLING, DEFAULT_ENABLE_BATTERY_POLLING
@@ -203,6 +348,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 DEFAULT_BATTERY_FAILURE_BACKOFF_SECONDS,
             )
         )
+
+    def _auth_key() -> str:
+        return entry.options.get(CONF_AUTH_KEY, DEFAULT_AUTH_KEY)
 
     def _update_method(service_info: BluetoothServiceInfoBleak) -> MiBandParsed:
         steps = _parse_steps_from_fee0(service_info)
@@ -312,10 +460,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
         try:
-            battery = await _async_read_battery(connectable_device, address)
-        except TimeoutError:
+            battery = await _async_read_battery(connectable_device, address, _auth_key())
+        except MiBandConnectTimeoutError:
             store["last_battery_failure_monotonic"] = time.monotonic()
             _LOGGER.warning("Battery poll failed for %s: connect_timeout", address)
+            return store["last_parsed"]
+        except MiBandAuthError as err:
+            store["last_battery_failure_monotonic"] = time.monotonic()
+            _LOGGER.warning(
+                "Battery poll failed for %s: auth_failed, %s",
+                address,
+                err,
+                exc_info=True,
+            )
+            return store["last_parsed"]
+        except MiBandBatteryReadError as err:
+            store["last_battery_failure_monotonic"] = time.monotonic()
+            _LOGGER.warning(
+                "Battery poll failed for %s: %s",
+                address,
+                err,
+                exc_info=True,
+            )
             return store["last_parsed"]
         except Exception as err:
             store["last_battery_failure_monotonic"] = time.monotonic()

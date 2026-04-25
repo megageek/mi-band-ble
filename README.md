@@ -57,6 +57,7 @@ After adding the integration, open **Configure** to adjust optional battery poll
 
 - **Enable battery polling**: Off by default. Turn this on only if your Bluetooth setup can make reliable active BLE connections to the band.
 - **Battery retry backoff**: Controls how long the integration waits before retrying a failed battery read.
+- **Mi Band auth key**: Optional 32-character hexadecimal key for Mi Band 5 and other models that require auth-key authentication before GATT reads.
 
 ## Sensors
 
@@ -82,7 +83,8 @@ Additional battery history sensors are created disabled by default:
 - **Connectable required for battery**: Battery entities need the Mi Band to be connectable and in range of a connectable Home Assistant Bluetooth adapter.
 - **Battery efficient**: Battery reads are infrequent and disconnect immediately after reading.
 - **Update frequency**: Advertisement-backed sensors update as broadcasts arrive. Battery data is refreshed about every 6 hours when the band is reachable.
-- **Authentication limitation**: Some Mi Band models or firmware versions require bonding or an auth key before GATT characteristics can be read. This integration can attempt the active connection, but it does not currently implement Mi Band auth-key negotiation.
+- **Auth-key support**: Some Mi Band models or firmware versions require an auth key before GATT characteristics can be read. Paste a key obtained from Notify, Zepp Life/Mi Fit, or a freemyband-style flow into the integration options.
+- **Auth-key storage**: The auth key is stored in Home Assistant's config entry options. Do not share logs or config storage that include your key.
 
 ## Troubleshooting
 
@@ -104,7 +106,11 @@ Additional battery history sensors are created disabled by default:
 - Enable debug logging for `custom_components.mi-band-ble` and check the battery poll reason.
 - `no_connectable_device` means Home Assistant is only seeing passive advertisements; move the band closer to a connectable Bluetooth adapter or enable a connectable Bluetooth proxy.
 - `connect_timeout` means a connectable device was found, but the connection did not complete before the timeout.
-- `connect_or_gatt_failed` means the connection/read failed after polling started. If this persists, the band may require pairing or an auth key, which is not currently supported.
+- `auth_failed` means the configured key was rejected, the auth characteristic was unavailable, or the auth notification flow timed out.
+- `auth_not_configured_maybe_required` means the battery read failed without an auth key configured; Mi Band 5 usually requires a valid key.
+- `battery_gatt_failed` means authentication succeeded, but the battery characteristic read failed.
+- `connect_or_gatt_failed` means the connection/read failed after polling started with an unexpected error.
+- If you reset or unpair the band, the auth key may be invalidated and need to be retrieved again.
 
 ## Development
 
