@@ -319,6 +319,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "address": address,
+        "battery_poll_in_progress": False,
         "last_parsed": MiBandParsed(),
         "last_battery_failure_monotonic": None,
     }
@@ -389,6 +390,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         connectable_device = _connectable_device(service_info)
         has_connectable_device = connectable_device is not None
+        battery_poll_in_progress = store["battery_poll_in_progress"]
         last_failure = store["last_battery_failure_monotonic"]
         failure_backoff_remaining = 0.0
         if last_failure is not None:
@@ -401,13 +403,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.state == CoreState.running
             and (last_poll is None or last_poll >= BATTERY_POLL_INTERVAL_SECONDS)
             and has_connectable_device
+            and not battery_poll_in_progress
             and failure_backoff_remaining == 0.0
         )
         _LOGGER.debug(
             (
                 "Battery poll check for %s: should_poll=%s, hass_running=%s, "
                 "last_poll=%s, has_connectable_device=%s, service_info_connectable=%s, "
-                "failure_backoff_remaining=%s"
+                "battery_poll_in_progress=%s, failure_backoff_remaining=%s"
             ),
             service_info.device.address,
             should_poll,
@@ -415,8 +418,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             last_poll,
             has_connectable_device,
             service_info.connectable,
+            battery_poll_in_progress,
             round(failure_backoff_remaining, 1),
         )
+        if battery_poll_in_progress:
+            _LOGGER.debug(
+                "Battery poll skipped for %s because another battery poll is already running",
+                service_info.device.address,
+            )
         if not has_connectable_device:
             _LOGGER.debug(
                 (
@@ -438,76 +447,87 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _async_poll(service_info: BluetoothServiceInfoBleak) -> MiBandParsed:
         address = service_info.device.address
+        if store["battery_poll_in_progress"]:
+            _LOGGER.debug(
+                "Battery poll skipped for %s because another battery poll is already running",
+                address,
+            )
+            return store["last_parsed"]
+
+        store["battery_poll_in_progress"] = True
         connectable_device = _connectable_device(service_info)
 
-        if connectable_device is None:
+        try:
+            if connectable_device is None:
+                _LOGGER.debug(
+                    (
+                        "Battery poll skipped for %s: no_connectable_device, "
+                        "service_info_connectable=%s"
+                    ),
+                    address,
+                    service_info.connectable,
+                )
+                return store["last_parsed"]
+
             _LOGGER.debug(
-                (
-                    "Battery poll skipped for %s: no_connectable_device, "
-                    "service_info_connectable=%s"
-                ),
+                "Starting battery poll for %s: service_info_connectable=%s, device_address=%s, details=%s",
                 address,
                 service_info.connectable,
+                connectable_device.address,
+                getattr(connectable_device, "details", None),
             )
-            return store["last_parsed"]
 
-        _LOGGER.debug(
-            "Starting battery poll for %s: service_info_connectable=%s, device_address=%s, details=%s",
-            address,
-            service_info.connectable,
-            connectable_device.address,
-            getattr(connectable_device, "details", None),
-        )
+            try:
+                battery = await _async_read_battery(connectable_device, address, _auth_key())
+            except MiBandConnectTimeoutError:
+                store["last_battery_failure_monotonic"] = time.monotonic()
+                _LOGGER.warning("Battery poll failed for %s: connect_timeout", address)
+                return store["last_parsed"]
+            except MiBandAuthError as err:
+                store["last_battery_failure_monotonic"] = time.monotonic()
+                _LOGGER.warning(
+                    "Battery poll failed for %s: auth_failed, %s",
+                    address,
+                    err,
+                    exc_info=True,
+                )
+                return store["last_parsed"]
+            except MiBandBatteryReadError as err:
+                store["last_battery_failure_monotonic"] = time.monotonic()
+                _LOGGER.warning(
+                    "Battery poll failed for %s: %s",
+                    address,
+                    err,
+                    exc_info=True,
+                )
+                return store["last_parsed"]
+            except Exception as err:
+                store["last_battery_failure_monotonic"] = time.monotonic()
+                _LOGGER.warning(
+                    "Battery poll failed for %s: connect_or_gatt_failed, %s: %s",
+                    address,
+                    type(err).__name__,
+                    err,
+                    exc_info=True,
+                )
+                return store["last_parsed"]
 
-        try:
-            battery = await _async_read_battery(connectable_device, address, _auth_key())
-        except MiBandConnectTimeoutError:
-            store["last_battery_failure_monotonic"] = time.monotonic()
-            _LOGGER.warning("Battery poll failed for %s: connect_timeout", address)
-            return store["last_parsed"]
-        except MiBandAuthError as err:
-            store["last_battery_failure_monotonic"] = time.monotonic()
-            _LOGGER.warning(
-                "Battery poll failed for %s: auth_failed, %s",
+            if battery is None:
+                _LOGGER.debug("Battery poll did not produce parsed data for %s", address)
+                return store["last_parsed"]
+
+            store["last_battery_failure_monotonic"] = None
+            parsed = _combine(store["last_parsed"], battery)
+            store["last_parsed"] = parsed
+            _LOGGER.debug(
+                "Battery poll succeeded for %s: battery=%s charging=%s",
                 address,
-                err,
-                exc_info=True,
+                battery.battery,
+                battery.charging,
             )
-            return store["last_parsed"]
-        except MiBandBatteryReadError as err:
-            store["last_battery_failure_monotonic"] = time.monotonic()
-            _LOGGER.warning(
-                "Battery poll failed for %s: %s",
-                address,
-                err,
-                exc_info=True,
-            )
-            return store["last_parsed"]
-        except Exception as err:
-            store["last_battery_failure_monotonic"] = time.monotonic()
-            _LOGGER.warning(
-                "Battery poll failed for %s: connect_or_gatt_failed, %s: %s",
-                address,
-                type(err).__name__,
-                err,
-                exc_info=True,
-            )
-            return store["last_parsed"]
-
-        if battery is None:
-            _LOGGER.debug("Battery poll did not produce parsed data for %s", address)
-            return store["last_parsed"]
-
-        store["last_battery_failure_monotonic"] = None
-        parsed = _combine(store["last_parsed"], battery)
-        store["last_parsed"] = parsed
-        _LOGGER.debug(
-            "Battery poll succeeded for %s: battery=%s charging=%s",
-            address,
-            battery.battery,
-            battery.charging,
-        )
-        return parsed
+            return parsed
+        finally:
+            store["battery_poll_in_progress"] = False
 
     coordinator = store["coordinator"] = ActiveBluetoothProcessorCoordinator(
         hass,
