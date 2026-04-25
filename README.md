@@ -51,6 +51,13 @@ This integration connects to Xiaomi Mi Band devices via Bluetooth Low Energy. It
 
 The integration will automatically discover Mi Band devices broadcasting nearby.
 
+### Options
+
+After adding the integration, open **Configure** to adjust optional battery polling.
+
+- **Enable battery polling**: Off by default. Turn this on only if your Bluetooth setup can make reliable active BLE connections to the band.
+- **Battery retry backoff**: Controls how long the integration waits before retrying a failed battery read.
+
 ## Sensors
 
 Once configured, the following sensors are available:
@@ -71,7 +78,7 @@ Additional battery history sensors are created disabled by default:
 
 ## Technical Notes
 
-- **Passive plus active reads**: Steps, heart rate, RSSI, and presence come from advertisements. Battery details are fetched with a short active BLE read.
+- **Passive plus active reads**: Steps, heart rate, RSSI, and presence come from advertisements. Battery details are fetched with a short active BLE read when battery polling is enabled.
 - **Connectable required for battery**: Battery entities need the Mi Band to be connectable and in range of a connectable Home Assistant Bluetooth adapter.
 - **Battery efficient**: Battery reads are infrequent and disconnect immediately after reading.
 - **Update frequency**: Advertisement-backed sensors update as broadcasts arrive. Battery data is refreshed about every 6 hours when the band is reachable.

@@ -24,6 +24,10 @@ from homeassistant.util import dt as dt_util
 from .const import (
     BATTERY_CHARACTERISTIC_UUID,
     BATTERY_POLL_INTERVAL_SECONDS,
+    CONF_BATTERY_FAILURE_BACKOFF_SECONDS,
+    CONF_ENABLE_BATTERY_POLLING,
+    DEFAULT_BATTERY_FAILURE_BACKOFF_SECONDS,
+    DEFAULT_ENABLE_BATTERY_POLLING,
     DOMAIN,
     MI_MANUFACTURER_ID,
     MI_SERVICE_UUID_FULL,
@@ -33,7 +37,6 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 BATTERY_READ_TIMEOUT: Final = 10.0
 BATTERY_TOTAL_TIMEOUT: Final = 15.0
-BATTERY_FAILURE_BACKOFF_SECONDS: Final = 60 * 60
 
 
 @dataclasses.dataclass(frozen=True)
@@ -188,6 +191,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     store = hass.data[DOMAIN][entry.entry_id]
 
+    def _battery_polling_enabled() -> bool:
+        return entry.options.get(
+            CONF_ENABLE_BATTERY_POLLING, DEFAULT_ENABLE_BATTERY_POLLING
+        )
+
+    def _battery_failure_backoff_seconds() -> int:
+        return int(
+            entry.options.get(
+                CONF_BATTERY_FAILURE_BACKOFF_SECONDS,
+                DEFAULT_BATTERY_FAILURE_BACKOFF_SECONDS,
+            )
+        )
+
     def _update_method(service_info: BluetoothServiceInfoBleak) -> MiBandParsed:
         steps = _parse_steps_from_fee0(service_info)
         heart_rate = _parse_heart_rate(service_info)
@@ -216,6 +232,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     def _needs_poll(
         service_info: BluetoothServiceInfoBleak, last_poll: float | None
     ) -> bool:
+        if not _battery_polling_enabled():
+            _LOGGER.debug(
+                "Battery poll check for %s: should_poll=False, battery polling disabled",
+                service_info.device.address,
+            )
+            return False
+
         connectable_device = (
             service_info.device
             if service_info.connectable
@@ -229,7 +252,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if last_failure is not None:
             failure_backoff_remaining = max(
                 0.0,
-                BATTERY_FAILURE_BACKOFF_SECONDS - (time.monotonic() - last_failure),
+                _battery_failure_backoff_seconds() - (time.monotonic() - last_failure),
             )
 
         should_poll = (
@@ -274,9 +297,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         try:
             battery = await _async_read_battery(connectable_device, address)
+        except TimeoutError:
+            store["last_battery_failure_monotonic"] = time.monotonic()
+            _LOGGER.warning("Battery poll timed out for %s", address)
+            return store["last_parsed"]
         except Exception:
             store["last_battery_failure_monotonic"] = time.monotonic()
-            _LOGGER.exception("Battery poll failed for %s", address)
+            _LOGGER.warning("Battery poll failed for %s", address, exc_info=True)
             return store["last_parsed"]
 
         if battery is None:

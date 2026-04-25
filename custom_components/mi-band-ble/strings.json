@@ -9,5 +9,16 @@
     "abort": {
       "not_supported": "This Bluetooth device doesn't look like a supported Mi Band advertisement."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Mi Band BLE Options",
+        "data": {
+          "enable_battery_polling": "Enable battery polling",
+          "battery_failure_backoff_seconds": "Battery retry backoff (seconds)"
+        }
+      }
+    }
   }
 }

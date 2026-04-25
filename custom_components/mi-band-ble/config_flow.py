@@ -7,10 +7,34 @@ from homeassistant import config_entries
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
 
 from .const import (
+    CONF_BATTERY_FAILURE_BACKOFF_SECONDS,
+    CONF_ENABLE_BATTERY_POLLING,
+    DEFAULT_BATTERY_FAILURE_BACKOFF_SECONDS,
+    DEFAULT_ENABLE_BATTERY_POLLING,
     DOMAIN,
-    MI_SERVICE_UUID_FULL,
     MI_MANUFACTURER_ID,
+    MI_SERVICE_UUID_FULL,
 )
+
+
+def _options_schema(options: dict[str, Any]) -> vol.Schema:
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_ENABLE_BATTERY_POLLING,
+                default=options.get(
+                    CONF_ENABLE_BATTERY_POLLING, DEFAULT_ENABLE_BATTERY_POLLING
+                ),
+            ): bool,
+            vol.Required(
+                CONF_BATTERY_FAILURE_BACKOFF_SECONDS,
+                default=options.get(
+                    CONF_BATTERY_FAILURE_BACKOFF_SECONDS,
+                    DEFAULT_BATTERY_FAILURE_BACKOFF_SECONDS,
+                ),
+            ): vol.All(vol.Coerce(int), vol.Range(min=60, max=24 * 60 * 60)),
+        }
+    )
 
 
 def _looks_like_miband(service_info: BluetoothServiceInfoBleak) -> bool:
@@ -29,6 +53,12 @@ def _looks_like_miband(service_info: BluetoothServiceInfoBleak) -> bool:
 
 class MiBandAdvConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
+
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> MiBandOptionsFlow:
+        return MiBandOptionsFlow(config_entry)
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
@@ -61,4 +91,20 @@ class MiBandAdvConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="bluetooth_confirm",
             data_schema=vol.Schema({}),
             description_placeholders=self.context.get("title_placeholders"),
+        )
+
+
+class MiBandOptionsFlow(config_entries.OptionsFlow):
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        self.config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=_options_schema(dict(self.config_entry.options)),
         )

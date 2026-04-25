@@ -3,6 +3,11 @@ DOMAIN = "mi-band-ble"
 PLATFORMS = ["sensor", "binary_sensor"]
 
 BATTERY_POLL_INTERVAL_SECONDS = 6 * 60 * 60
+DEFAULT_ENABLE_BATTERY_POLLING = False
+DEFAULT_BATTERY_FAILURE_BACKOFF_SECONDS = 60 * 60
+
+CONF_ENABLE_BATTERY_POLLING = "enable_battery_polling"
+CONF_BATTERY_FAILURE_BACKOFF_SECONDS = "battery_failure_backoff_seconds"
 
 # HA advert monitor shows service_data keyed by the full 128-bit UUID:
 MI_SERVICE_UUID_FULL = "0000fee0-0000-1000-8000-00805f9b34fb"
