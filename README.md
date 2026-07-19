@@ -22,7 +22,7 @@ This integration connects to Xiaomi Mi Band devices via Bluetooth Low Energy. It
 
 ## Requirements
 
-- Home Assistant 2023.12 or later
+- Home Assistant 2026.3 or later
 - Bluetooth integrated in Home Assistant
 - A Xiaomi Mi Band within Bluetooth range
 
@@ -36,8 +36,23 @@ This integration connects to Xiaomi Mi Band devices via Bluetooth Low Energy. It
 
 ### Option 2: Manual
 
-1. Copy the `mi-band-ble` folder to `/config/custom_components/` in your Home Assistant configuration directory
+1. Copy the `mi_band_ble` folder to `/config/custom_components/` in your Home Assistant configuration directory
 2. Restart Home Assistant
+
+### Upgrading from 0.2.x
+
+Version 0.3.0 changes the integration domain from the invalid `mi-band-ble` to
+`mi_band_ble`. After updating and restarting Home Assistant, add **Mi Band BLE** again
+from **Settings → Devices & services** while the old entry is still present. The new
+integration detects the legacy entry by the band's Bluetooth address and transfers
+its options, devices, entity IDs, and customizations before removing it.
+After the migration succeeds, remove a leftover `custom_components/mi-band-ble`
+directory if your previous installer did not remove it automatically.
+
+For a manual upgrade, remove the old `custom_components/mi-band-ble` directory and
+copy `custom_components/mi_band_ble` into place. Do not delete the old integration
+entry in Home Assistant before adding the renamed integration, because that entry is
+the source of the migration data.
 
 ## Configuration
 
@@ -105,7 +120,7 @@ Additional battery history sensors are created disabled by default:
 
 ### Battery polling does not update
 
-- Enable debug logging for `custom_components.mi-band-ble` and check the battery poll reason.
+- Enable debug logging for `custom_components.mi_band_ble` and check the battery poll reason.
 - `no_connectable_device` means Home Assistant is only seeing passive advertisements; move the band closer to a connectable Bluetooth adapter or enable a connectable Bluetooth proxy.
 - `connect_timeout` means a connectable device was found, but the connection did not complete before the timeout. This can happen if Notify, Zepp Life, or another app is currently connected to the band.
 - `auth_failed` means the configured key was rejected, the auth characteristic was unavailable, or the auth notification flow timed out.

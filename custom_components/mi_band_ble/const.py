@@ -1,4 +1,4 @@
-DOMAIN = "mi-band-ble"
+DOMAIN = "mi_band_ble"
 
 PLATFORMS = ["sensor", "binary_sensor"]
 

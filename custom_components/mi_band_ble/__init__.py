@@ -21,6 +21,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.components.bluetooth.active_update_processor import (
     ActiveBluetoothProcessorCoordinator,
 )
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
@@ -41,6 +42,7 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+LEGACY_DOMAIN: Final = "mi-band-ble"
 AUTH_COMMAND_SEND_KEY: Final = 0x01
 AUTH_COMMAND_REQUEST_RANDOM: Final = 0x02
 AUTH_COMMAND_SEND_ENCRYPTED: Final = 0x03
@@ -71,6 +73,87 @@ BATTERY_ENTITY_NAMES: Final = frozenset(
         "Battery Last Charging",
     }
 )
+
+
+def _devices_for_config_entry(
+    registry: dr.DeviceRegistry, entry_id: str
+) -> list[dr.DeviceEntry]:
+    """Return devices belonging to a config entry across HA registry versions."""
+    devices = []
+    for device in registry.devices.values():
+        config_entry_id = getattr(device, "config_entry_id", None)
+        config_entries = getattr(device, "config_entries", ())
+        if config_entry_id == entry_id or entry_id in config_entries:
+            devices.append(device)
+    return devices
+
+
+async def _async_migrate_legacy_entry(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> None:
+    """Move a matching legacy-domain entry and its registries in place."""
+    legacy_entry = next(
+        (
+            candidate
+            for candidate in hass.config_entries.async_entries(LEGACY_DOMAIN)
+            if candidate.unique_id == entry.unique_id
+        ),
+        None,
+    )
+    if legacy_entry is None:
+        return
+
+    if not await hass.config_entries.async_unload(legacy_entry.entry_id):
+        raise RuntimeError(
+            f"Unable to unload legacy config entry {legacy_entry.entry_id}"
+        )
+
+    hass.config_entries.async_update_entry(
+        entry,
+        data=dict(legacy_entry.data),
+        options=dict(legacy_entry.options),
+        title=legacy_entry.title,
+    )
+
+    entity_registry = er.async_get(hass)
+    for entity in er.async_entries_for_config_entry(
+        entity_registry, legacy_entry.entry_id
+    ):
+        entity_registry.async_update_entity_platform(
+            entity.entity_id,
+            DOMAIN,
+            new_config_entry_id=entry.entry_id,
+        )
+
+    device_registry = dr.async_get(hass)
+    for device in _devices_for_config_entry(
+        device_registry, legacy_entry.entry_id
+    ):
+        identifiers = {
+            (DOMAIN if domain == LEGACY_DOMAIN else domain, identifier)
+            for domain, identifier in device.identifiers
+        }
+        if hasattr(device, "config_entry_id"):
+            device_registry.async_update_device(
+                device.id,
+                new_config_entry_id=entry.entry_id,
+                new_identifiers=identifiers,
+            )
+        else:
+            device_registry.async_update_device(
+                device.id,
+                add_config_entry_id=entry.entry_id,
+                remove_config_entry_id=legacy_entry.entry_id,
+                new_identifiers=identifiers,
+            )
+
+    await hass.config_entries.async_remove(legacy_entry.entry_id)
+    _LOGGER.info(
+        "Migrated legacy config entry %s to %s as %s",
+        legacy_entry.entry_id,
+        DOMAIN,
+        entry.entry_id,
+    )
 
 
 class MiBandConnectTimeoutError(Exception):
@@ -427,6 +510,8 @@ def _parse_heart_rate(service_info: BluetoothServiceInfoBleak) -> int | None:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    await _async_migrate_legacy_entry(hass, entry)
+
     address = entry.unique_id
     assert address is not None
 
